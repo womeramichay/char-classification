@@ -90,31 +90,45 @@ class MyClassifier(CharClassifier):
     - preprocess: binarize to 0/1, crop bbox, pad to square, block-mean downsample
     - training: build per-class prototype (mean feature vector)
     - augmentation: k augmented copies per sample; each copy applies exactly ONE transform
+    - prediction: nearest prototype via L2 or cosine distance
     """
 
     def __init__(
         self,
+        # feature extraction
         target: int = 15,
-        k: int = 4,
+
+        # augmentation
+        k: int = 3,
         max_shift: int = 2,
-        max_rot: float = 10.0,
-        p_flip: float = 0.003,
-        weights=(0.55, 0.35, 0.10),  # (shift, rotate, noise)
+        max_rot: float = 12.0,
+        p_flip: float = 0.0,                 # default OFF
+        weights=(0.45, 0.55, 0.0),           # (shift, rotate, noise) default OFF
+
+        # distance metric
+        distance: str = "l2",                # "l2" or "cosine"
+
+        # reproducibility
         seed: int | None = 42,
     ):
-        self.target = target
-        self.k = k
-        self.max_shift = max_shift
-        self.max_rot = max_rot
-        self.p_flip = p_flip
+        self.target = int(target)
+
+        self.k = int(k)
+        self.max_shift = int(max_shift)
+        self.max_rot = float(max_rot)
+        self.p_flip = float(p_flip)
         self.weights = tuple(weights)
+
+        self.distance = distance
+        if self.distance not in ("l2", "cosine"):
+            raise ValueError("distance must be 'l2' or 'cosine'")
+
         self.seed = seed
-
-        self.prototypes = None  # dict: char -> prototype vector
-
         if self.seed is not None:
             random.seed(self.seed)
             np.random.seed(self.seed)
+
+        self.prototypes = None  # dict: char -> prototype vector
 
     # =========================
     # Preprocessing
@@ -122,7 +136,7 @@ class MyClassifier(CharClassifier):
     def _to_features(self, img: np.ndarray) -> np.ndarray:
         """
         img: 2D uint8 array with values {0,255}
-        Returns a flattened feature vector.
+        Returns a flattened feature vector of length target*target.
         """
 
         # 1) binarize: ink=1, background=0 (in this task ink pixels are 0)
@@ -146,23 +160,36 @@ class MyClassifier(CharClassifier):
         )
 
         # 4) ensure minimum size before downsampling
-        h, w = x.shape
+        h = x.shape[0]
         if h < self.target:
             pad = self.target - h
-            x = np.pad(x,((pad // 2, pad - pad // 2),
-                        (pad // 2, pad - pad // 2)),
-        mode="constant",
-        constant_values=0.0,
-    )
-          
-        # downsample via block-mean pooling to (target x target)
+            x = np.pad(
+                x,
+                ((pad // 2, pad - pad // 2),
+                 (pad // 2, pad - pad // 2)),
+                mode="constant",
+                constant_values=0.0
+            )
+
+        # 5) downsample via block-mean pooling to (target x target)
         s = x.shape[0]
-        step = s // self.target
+        step = max(1, s // self.target)
+
+        # make divisible by target
         x = x[: step * self.target, : step * self.target]
+
+        # reshape + mean pool
         x = x.reshape(self.target, step, self.target, step).mean(axis=(1, 3))
 
-
         return x.reshape(-1)
+
+    # =========================
+    # Distance
+    # =========================
+    @staticmethod
+    def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+        denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-8
+        return 1.0 - float(np.dot(a, b) / denom)
 
     # =========================
     # Augmentations (binary-safe)
@@ -188,6 +215,8 @@ class MyClassifier(CharClassifier):
 
     @staticmethod
     def _saltpepper_binary(img: np.ndarray, p_flip: float = 0.003) -> np.ndarray:
+        if p_flip <= 0:
+            return img
         out = img.copy()
         h, w = out.shape
         n = int(h * w * p_flip)
@@ -203,7 +232,6 @@ class MyClassifier(CharClassifier):
     # =========================
     def train(self, generator: CharGenerator):
         by_char = {c: [] for c in generator.chars}
-
         transforms = ["shift", "rotate", "noise"]
 
         for char, img in generator:
@@ -241,11 +269,17 @@ class MyClassifier(CharClassifier):
     # =========================
     def predict(self, image: np.ndarray):
         f = self._to_features(image)
+
         best_char, best_dist = None, float("inf")
         for c, p in self.prototypes.items():
-            d = np.sum((f - p) ** 2)
+            if self.distance == "cosine":
+                d = self._cosine_distance(f, p)
+            else:
+                d = float(np.sum((f - p) ** 2))
+
             if d < best_dist:
                 best_char, best_dist = c, d
+
         return best_char
 
 
