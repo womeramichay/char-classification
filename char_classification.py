@@ -6,7 +6,7 @@
 # is created using different fonts.
 #
 # Implement a classifier that is optimized for the "Digits" and "ASCII" tests.
-# 
+#
 
 import itertools
 import random
@@ -65,7 +65,6 @@ class CharGenerator:
 
 
 class CharClassifier:
-
     def train(self, generator: CharGenerator):
         raise NotImplementedError()
 
@@ -74,7 +73,6 @@ class CharClassifier:
 
 
 class RandomClassifier(CharClassifier):
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.chars = None
@@ -88,24 +86,46 @@ class RandomClassifier(CharClassifier):
 
 class MyClassifier(CharClassifier):
     """
-    Prototype-based character classifier with robust preprocessing
-    and light, controlled augmentation.
+    Prototype-based classifier:
+    - preprocess: binarize to 0/1, crop bbox, pad to square, block-mean downsample
+    - training: build per-class prototype (mean feature vector)
+    - augmentation: k augmented copies per sample; each copy applies exactly ONE transform
     """
 
-    def __init__(self):
-        self.prototypes = None  # dict: char -> mean feature vector
+    def __init__(
+        self,
+        target: int = 15,
+        k: int = 4,
+        max_shift: int = 2,
+        max_rot: float = 10.0,
+        p_flip: float = 0.003,
+        weights=(0.55, 0.35, 0.10),  # (shift, rotate, noise)
+        seed: int | None = 42,
+    ):
+        self.target = target
+        self.k = k
+        self.max_shift = max_shift
+        self.max_rot = max_rot
+        self.p_flip = p_flip
+        self.weights = tuple(weights)
+        self.seed = seed
+
+        self.prototypes = None  # dict: char -> prototype vector
+
+        if self.seed is not None:
+            random.seed(self.seed)
+            np.random.seed(self.seed)
 
     # =========================
     # Preprocessing
     # =========================
-    @staticmethod
-    def _to_features(img: np.ndarray, target: int = 15) -> np.ndarray:
+    def _to_features(self, img: np.ndarray) -> np.ndarray:
         """
         img: 2D uint8 array with values {0,255}
         Returns a flattened feature vector.
         """
 
-        # 1) binarize: ink=1, background=0
+        # 1) binarize: ink=1, background=0 (in this task ink pixels are 0)
         x = (img == 0).astype(np.float32)
 
         # 2) crop to foreground bounding box
@@ -125,10 +145,22 @@ class MyClassifier(CharClassifier):
             constant_values=0.0
         )
 
-        # 4) downsample via block-mean pooling
-        step = max(1, s // target)
-        x = x[: step * target, : step * target]
-        x = x.reshape(target, step, target, step).mean(axis=(1, 3))
+        # 4) ensure minimum size before downsampling
+        h, w = x.shape
+        if h < self.target:
+            pad = self.target - h
+            x = np.pad(x,((pad // 2, pad - pad // 2),
+                        (pad // 2, pad - pad // 2)),
+        mode="constant",
+        constant_values=0.0,
+    )
+          
+        # downsample via block-mean pooling to (target x target)
+        s = x.shape[0]
+        step = s // self.target
+        x = x[: step * self.target, : step * self.target]
+        x = x.reshape(self.target, step, self.target, step).mean(axis=(1, 3))
+
 
         return x.reshape(-1)
 
@@ -170,36 +202,31 @@ class MyClassifier(CharClassifier):
     # Training
     # =========================
     def train(self, generator: CharGenerator):
-        k = 2               # number of augmented copies per image
-        max_shift = 2
-        max_rot = 10        # degrees
-
         by_char = {c: [] for c in generator.chars}
 
         transforms = ["shift", "rotate", "noise"]
-        weights = [0.55, 0.35, 0.10]  # exactly ONE transform per augmentation
 
         for char, img in generator:
             # original
             by_char[char].append(self._to_features(img))
 
-            # augmented samples
-            for _ in range(k):
-                t = random.choices(transforms, weights=weights, k=1)[0]
+            # augmented copies: exactly ONE transform per copy
+            for _ in range(self.k):
+                t = random.choices(transforms, weights=self.weights, k=1)[0]
 
                 if t == "shift":
                     aug = self._shift_binary(
                         img,
-                        random.randint(-max_shift, max_shift),
-                        random.randint(-max_shift, max_shift),
+                        random.randint(-self.max_shift, self.max_shift),
+                        random.randint(-self.max_shift, self.max_shift),
                     )
                 elif t == "rotate":
                     aug = self._rotate_binary(
                         img,
-                        random.uniform(-max_rot, max_rot),
+                        random.uniform(-self.max_rot, self.max_rot),
                     )
                 else:
-                    aug = self._saltpepper_binary(img)
+                    aug = self._saltpepper_binary(img, p_flip=self.p_flip)
 
                 by_char[char].append(self._to_features(aug))
 
@@ -222,7 +249,6 @@ class MyClassifier(CharClassifier):
         return best_char
 
 
-
 def calc_accuracy(classifier: CharClassifier, test_set_generator: CharGenerator):
     is_correct = [classifier.predict(img) == char for char, img in test_set_generator]
     return sum(is_correct) / len(is_correct)
@@ -239,14 +265,15 @@ TESTS = [
     Test(name="Digits", chars=set(string.digits), train_fonts=FONTS[:10], test_fonts=FONTS[10:30]),
     Test(name="Digits: Small Train Set", chars=set(string.digits), train_fonts=FONTS[:1], test_fonts=FONTS[10:30]),
     Test(name="ASCII", chars=set(string.ascii_letters), train_fonts=FONTS[:10], test_fonts=FONTS[10:30]),
-    Test(name="ASCII: Small Train Set", chars=set(string.ascii_letters), train_fonts=FONTS[:1],
-         test_fonts=FONTS[10:30]),
+    Test(name="ASCII: Small Train Set", chars=set(string.ascii_letters), train_fonts=FONTS[:1], test_fonts=FONTS[10:30]),
 ]
+
 
 if __name__ == '__main__':
 
     classifier_classes = [
-        RandomClassifier
+        RandomClassifier,
+        MyClassifier,
     ]
 
     results = []
